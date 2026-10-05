@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Publish short-lived work progress to the Omarchy top bar.
+
+Each job is an atomically written JSON record in
+$XDG_STATE_HOME/agent-progress.  The command deliberately has no dependency
+on a particular agent, terminal, or job runner: anything that can execute a
+command can report progress.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+JOB_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+ACTIVE_STATES = {"running", "paused", "blocked"}
+
+
+def state_dir() -> Path:
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    path = root / "agent-progress"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def timestamp() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def job_path(job_id: str) -> Path:
+    if not JOB_ID.fullmatch(job_id):
+        raise ValueError("job ID must use lowercase letters, digits, '.', '_' or '-' (up to 64 characters)")
+    return state_dir() / f"{job_id}.json"
+
+
+def read_job(job_id: str) -> dict:
+    path = job_path(job_id)
+    try:
+        with path.open(encoding="utf-8") as handle:
+            record = json.load(handle)
+    except FileNotFoundError:
+        raise ValueError(f"no progress job named '{job_id}'") from None
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read '{job_id}': {error}") from None
+    if not isinstance(record, dict):
+        raise ValueError(f"cannot read '{job_id}': record is not an object")
+    return record
+
+
+def write_job(record: dict) -> None:
+    path = job_path(str(record["id"]))
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{record['id']}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def validate_numbers(record: dict) -> None:
+    for key in ("current", "total"):
+        value = record.get(key)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            raise ValueError(f"{key} must be a non-negative whole number")
+    if record.get("total") is not None and record.get("current", 0) > record["total"]:
+        raise ValueError("current cannot exceed total")
+
+
+def update_record(record: dict, args: argparse.Namespace) -> dict:
+    for field in ("title", "detail", "unit", "current", "total", "state"):
+        value = getattr(args, field, None)
+        if value is not None:
+            record[field] = value
+    if record.get("state") not in {"running", "paused", "blocked", "completed", "failed"}:
+        raise ValueError("state must be running, paused, blocked, completed, or failed")
+    validate_numbers(record)
+    record["updatedAt"] = timestamp()
+    return record
+
+
+def start(args: argparse.Namespace) -> None:
+    now = timestamp()
+    record = {
+        "version": 1,
+        "id": args.id,
+        "title": args.title or args.id.replace("-", " ").replace("_", " ").title(),
+        "state": "running",
+        "current": args.current if args.current is not None else 0,
+        "total": args.total,
+        "unit": args.unit or "items",
+        "detail": args.detail or "",
+        "startedAt": now,
+        "updatedAt": now,
+    }
+    validate_numbers(record)
+    write_job(record)
+
+
+def update(args: argparse.Namespace) -> None:
+    write_job(update_record(read_job(args.id), args))
+
+
+def finish(args: argparse.Namespace) -> None:
+    record = read_job(args.id)
+    record["state"] = "completed"
+    if record.get("total") is not None:
+        record["current"] = record["total"]
+    if args.detail is not None:
+        record["detail"] = args.detail
+    record["updatedAt"] = timestamp()
+    write_job(record)
+
+
+def fail(args: argparse.Namespace) -> None:
+    record = read_job(args.id)
+    record["state"] = "failed"
+    if args.detail is not None:
+        record["detail"] = args.detail
+    record["updatedAt"] = timestamp()
+    write_job(record)
+
+
+def remove(args: argparse.Namespace) -> None:
+    try:
+        job_path(args.id).unlink()
+    except FileNotFoundError:
+        raise ValueError(f"no progress job named '{args.id}'") from None
+
+
+def list_jobs(args: argparse.Namespace) -> None:
+    records = []
+    for path in state_dir().glob("*.json"):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                record = json.load(handle)
+            if isinstance(record, dict) and record.get("state") in ACTIVE_STATES:
+                records.append(record)
+        except (OSError, json.JSONDecodeError):
+            continue
+    records.sort(key=lambda record: (str(record.get("startedAt", "")), str(record.get("id", ""))))
+    if args.json:
+        print(json.dumps(records, separators=(",", ":"), sort_keys=True))
+        return
+    for record in records:
+        current = record.get("current", 0)
+        total = record.get("total")
+        progress = f"{current}/{total}" if total is not None else str(current)
+        print(f"{record.get('id')}\t{record.get('state')}\t{progress}\t{record.get('title')}")
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="Publish work progress to the Omarchy top bar.")
+    commands = result.add_subparsers(dest="command", required=True)
+
+    def job_options(command: argparse.ArgumentParser, include_title: bool = False) -> None:
+        if include_title:
+            command.add_argument("--title", help="short bar/popup title")
+        command.add_argument("--current", type=int, help="completed items")
+        command.add_argument("--total", type=int, help="total items")
+        command.add_argument("--unit", help="item unit, such as photos or files")
+        command.add_argument("--detail", help="short status detail")
+
+    command = commands.add_parser("start", help="start or replace a job")
+    command.add_argument("id")
+    job_options(command, include_title=True)
+    command.set_defaults(handler=start)
+
+    command = commands.add_parser("update", help="update a job")
+    command.add_argument("id")
+    job_options(command, include_title=True)
+    command.add_argument("--state", choices=["running", "paused", "blocked", "completed", "failed"])
+    command.set_defaults(handler=update)
+
+    command = commands.add_parser("finish", help="mark a job complete and hide it")
+    command.add_argument("id")
+    command.add_argument("--detail")
+    command.set_defaults(handler=finish)
+
+    command = commands.add_parser("fail", help="mark a job failed and hide it")
+    command.add_argument("id")
+    command.add_argument("--detail")
+    command.set_defaults(handler=fail)
+
+    command = commands.add_parser("remove", help="remove a job record")
+    command.add_argument("id")
+    command.set_defaults(handler=remove)
+
+    command = commands.add_parser("list", help="list active jobs")
+    command.add_argument("--json", action="store_true", help="emit active records as JSON")
+    command.set_defaults(handler=list_jobs)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        args.handler(args)
+    except ValueError as error:
+        print(f"agent-progress: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

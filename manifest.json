@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "benredrew.progress",
+  "name": "Work Progress",
+  "version": "1.0.0",
+  "author": "benredrew",
+  "description": "Shows active agent and background-work progress in the bar",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Work Progress",
+    "description": "Active work reported through agent-progress",
+    "category": "Status",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

@@ -1,0 +1,619 @@
+import QtQuick
+import Quickshell
+import Quickshell.Hyprland._GlobalShortcuts
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+// One permanent bar slot backed by the jobs in ~/.local/state/agent-progress.
+// The command owns the file contract; the bar only renders its active records.
+BarWidget {
+  id: root
+  moduleName: "benredrew.progress"
+
+  readonly property string home: Quickshell.env("HOME") || ""
+  readonly property string progressDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/agent-progress"
+  property var jobs: []
+  property var jobIds: []
+  property var progressSnapshot: ({})
+  // Counts, rather than a boolean, preserve every progress unit that arrived
+  // between FileView refreshes. A 10 Hz producer can therefore emit ten
+  // distinct fronts without being visually rate-limited to one.
+  property var advanceCounts: ({})
+  property bool hasProgressSnapshot: false
+  property string selectedId: ""
+  property bool popupOpen: false
+  property bool pickerKeysRequested: false
+  property bool pickerKeysCommanded: false
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  readonly property var selectedJob: {
+    for (var i = 0; i < jobs.length; i++) {
+      if (String(jobs[i].id || "") === selectedId) return jobs[i]
+    }
+    return jobs.length > 0 ? jobs[0] : null
+  }
+
+  function jobFraction(job) {
+    if (!job) return 0
+    var total = job.total === null || job.total === undefined ? 0 : Number(job.total)
+    if (total <= 0) return 0.22
+    return Math.max(0.05, Math.min(1, Number(job.current || 0) / total))
+  }
+
+  readonly property real progressFraction: jobFraction(selectedJob)
+
+  function progressText(job) {
+    var current = Number(job.current || 0)
+    var total = job.total === null || job.total === undefined ? null : Number(job.total)
+    if (total !== null && total > 0) return String(current) + "/" + String(total) + " · " + String(Math.round(current * 100 / total)) + "%"
+    return current > 0 ? String(current) + (job.unit ? " " + String(job.unit) : "") : "working"
+  }
+
+  // The slot is intentionally permanent. A job starting never shifts the
+  // clock or Dual City.
+  readonly property string label: selectedJob
+    ? (compact ? String(Math.round(progressFraction * 100)) + "%" : progressText(selectedJob))
+    : "Idle"
+
+  // Placed in the centre section just before the anchor (Dual City, or
+  // Omarchy's clock), the slot's right edge is pinned and only its width is
+  // free. Fill the room back to the bar's left section (workspaces), less
+  // whatever shares this group to the meter's left. The plugin API hides other
+  // widgets, so both sections are found by `region` in this bar window's own
+  // item tree and only their geometry is read. Anywhere else, keep the
+  // default width.
+  readonly property real defaultWidth: Style.space(152)
+  readonly property real maximumWidth: Style.space(320)
+  readonly property real minimumWidth: Style.space(56)
+  // Visible gaps match on both sides: the workspaces end with ~9 of empty
+  // padding and the anchor's text starts with ~8, so the raw gaps differ.
+  readonly property real sectionGap: Style.space(4)
+  property real room: defaultWidth
+  property Item leftSection: null
+  readonly property real slotWidth: Math.round(Math.max(minimumWidth, Math.min(maximumWidth, room)))
+  readonly property bool compact: slotWidth < Style.space(128)
+
+  function findLeftSection(item) {
+    if (!item) return null
+    if (item.region === "left" && item.entries !== undefined) return item
+    var children = item.children || []
+    for (var i = 0; i < children.length; i++) {
+      var found = findLeftSection(children[i])
+      if (found) return found
+    }
+    return null
+  }
+
+  function enclosingSection() {
+    for (var item = root.parent; item; item = item.parent) {
+      if (item.region !== undefined && item.entries !== undefined) return item
+    }
+    return null
+  }
+
+  function measureRoom() {
+    // Only the group before the anchor ends left of the bar's middle; after
+    // the anchor, the right edge is not pinned and growing would push it.
+    var group = enclosingSection()
+    var top = root
+    while (top.parent) top = top.parent
+    var beforeAnchor = group && group.region === "center"
+      && group.mapToItem(null, group.width, 0).x <= top.width / 2
+    if (vertical || !beforeAnchor) {
+      if (room !== defaultWidth) room = defaultWidth
+      return
+    }
+    if (!leftSection || !leftSection.visible) {
+      leftSection = findLeftSection(top)
+      if (!leftSection) return
+    }
+    var right = root.mapToItem(null, root.width, 0).x
+    var before = root.mapToItem(null, 0, 0).x - group.mapToItem(null, 0, 0).x
+    var leftEdge = leftSection.mapToItem(null, leftSection.width, 0).x
+    var next = right - leftEdge - sectionGap - before
+    if (Math.abs(next - room) >= 1) room = next
+  }
+
+  // Workspace and neighbour widths change with live text; a slow poll is
+  // simpler than wiring every geometry signal of the shell's private items.
+  Timer {
+    interval: 1000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.measureRoom()
+  }
+
+  readonly property string tooltip: {
+    if (!selectedJob) return "No active work"
+    var lines = []
+    for (var i = 0; i < jobs.length; i++) {
+      var job = jobs[i]
+      var title = String(job.title || job.id || "Work")
+      var detail = job.detail ? " — " + String(job.detail) : ""
+      lines.push(title + ": " + progressText(job) + detail)
+    }
+    return lines.join("\n")
+  }
+
+  function applyJobListing(output) {
+    var ids = []
+    var lines = String(output || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var name = lines[i].trim()
+      if (name.slice(-5) === ".json") ids.push(name.slice(0, -5))
+    }
+    ids.sort()
+    if (JSON.stringify(ids) !== JSON.stringify(jobIds)) jobIds = ids
+  }
+
+  function selectJob(id) {
+    selectedId = id
+    popupOpen = false
+  }
+
+  // Keyboard movement previews another job immediately; clicking a row still
+  // selects it and dismisses the picker.
+  function selectRelative(delta) {
+    if (jobs.length === 0) return
+    var index = 0
+    for (var i = 0; i < jobs.length; i++) {
+      if (String(jobs[i].id || "") === selectedId) {
+        index = i
+        break
+      }
+    }
+    index = (index + delta + jobs.length) % jobs.length
+    selectedId = String(jobs[index].id || "")
+  }
+
+  function rebuildJobs() {
+    var active = []
+    var nextSnapshot = {}
+    var advances = {}
+    for (var i = 0; i < jobInstantiator.count; i++) {
+      var job = jobInstantiator.objectAt(i)
+      var record = job ? job.record : null
+      if (!record) continue
+      var state = String(record.state || "")
+      if (state === "running" || state === "paused" || state === "blocked") {
+        active.push(record)
+        var id = String(record.id || "")
+        var current = Number(record.current || 0)
+        if (hasProgressSnapshot && progressSnapshot[id] !== undefined && current > Number(progressSnapshot[id]))
+          advances[id] = current - Number(progressSnapshot[id])
+        nextSnapshot[id] = current
+      }
+    }
+    active.sort(function(a, b) {
+      return String(a.startedAt || "").localeCompare(String(b.startedAt || ""))
+    })
+    jobs = active
+
+    var selectedStillActive = false
+    for (var j = 0; j < jobs.length; j++) {
+      if (String(jobs[j].id || "") === selectedId) selectedStillActive = true
+    }
+    if (!selectedStillActive) selectedId = jobs.length > 0 ? String(jobs[0].id || "") : ""
+
+    progressSnapshot = nextSnapshot
+    advanceCounts = advances
+    if (hasProgressSnapshot && Number(advances[selectedId] || 0) > 0)
+      Qt.callLater(function() { fill.launchWaves(Number(advances[selectedId])) })
+    hasProgressSnapshot = true
+  }
+
+  function refresh() {
+    if (!listProcess.running) listProcess.running = true
+  }
+
+  readonly property bool opened: popupOpen
+  function open() {
+    popupOpen = true
+    Qt.callLater(function() { content.forceActiveFocus() })
+  }
+  function close() { popupOpen = false }
+  function toggle() {
+    if (popupOpen) close()
+    else open()
+  }
+  function closeForPopoutSwitch() { close() }
+
+  // Keep the compositor binding state in step with the popup even if it is
+  // toggled again before a preceding hyprctl call has exited.
+  function requestPickerKeys(enabled) {
+    pickerKeysRequested = enabled
+    if (!pickerKeys.running) {
+      pickerKeysCommanded = pickerKeysRequested
+      pickerKeys.command = ["/usr/bin/hyprctl", "eval", "benredrew_progress_keys(" + (pickerKeysCommanded ? "true" : "false") + ")"]
+      pickerKeys.running = true
+    }
+  }
+
+  Process {
+    id: listProcess
+    running: false
+    command: ["find", root.progressDir, "-maxdepth", "1", "-name", "*.json", "-printf", "%f\\n"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyJobListing(text)
+    }
+  }
+
+  Instantiator {
+    id: jobInstantiator
+    model: root.jobIds
+
+    delegate: ProgressJob {
+      required property var modelData
+      path: root.progressDir + "/" + modelData + ".json"
+      onRecordChanged: root.rebuildJobs()
+    }
+
+    onObjectAdded: root.rebuildJobs()
+    onObjectRemoved: root.rebuildJobs()
+  }
+
+  Timer {
+    interval: 2000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refresh()
+  }
+
+  IpcHandler {
+    target: "benredrew.progress"
+    function open(): void { root.open() }
+    function toggle(): void { root.toggle() }
+    function refresh(): void { root.refresh() }
+    function previous(): void { if (root.popupOpen) root.selectRelative(-1) }
+    function next(): void { if (root.popupOpen) root.selectRelative(1) }
+    function close(): void { root.close() }
+  }
+
+  // Hyprland invokes these in the already-running Quickshell process. Unlike
+  // shell IPC, there is no process launch on each arrow or I/K keypress.
+  GlobalShortcut {
+    appid: "benredrew.progress"
+    name: "toggle"
+    description: "Toggle work progress picker"
+    onPressed: root.toggle()
+  }
+  GlobalShortcut {
+    appid: "benredrew.progress"
+    name: "previous"
+    description: "Previous progress timer"
+    onPressed: { if (root.popupOpen) root.selectRelative(-1) }
+  }
+  GlobalShortcut {
+    appid: "benredrew.progress"
+    name: "next"
+    description: "Next progress timer"
+    onPressed: { if (root.popupOpen) root.selectRelative(1) }
+  }
+  GlobalShortcut {
+    appid: "benredrew.progress"
+    name: "close"
+    description: "Close work progress picker"
+    onPressed: root.close()
+  }
+  GlobalShortcut {
+    appid: "benredrew.progress"
+    name: "confirm"
+    description: "Confirm work progress timer"
+    onPressed: root.close()
+  }
+
+  // PopupWindow surfaces are mouse-focusable but do not reliably receive
+  // keyboard input on this compositor. Enable picker keys only while open.
+  Process {
+    id: pickerKeys
+    running: false
+    command: []
+    onExited: {
+      if (root.pickerKeysCommanded !== root.pickerKeysRequested)
+        root.requestPickerKeys(root.pickerKeysRequested)
+    }
+  }
+
+  onPopupOpenChanged: {
+    requestPickerKeys(popupOpen)
+  }
+
+  WidgetButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: root.label
+    tooltipText: root.popupOpen ? "" : root.tooltip
+    // The width follows the room measured above, never the label, so changing
+    // percentages do not jitter. Its fill is deliberately quieter than an OSD.
+    fixedWidth: root.slotWidth
+    fixedHeight: root.barSize
+    active: false
+    labelVisible: false
+    horizontalMargin: 8
+    clip: true
+    onPressed: function(button) {
+      if (button === Qt.LeftButton) {
+        if (root.popupOpen) root.close()
+        else root.open()
+      }
+      else root.refresh()
+    }
+
+    Rectangle {
+      id: track
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(3)
+      anchors.rightMargin: Style.space(8)
+      height: parent.height - Style.space(10)
+      z: 0
+      clip: true
+      radius: Style.space(3)
+      color: Style.normalFillFor(root.bar.foreground, Color.accent)
+      border.width: 1
+      border.color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.14)
+
+      Rectangle {
+        id: fill
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        width: parent.width * root.progressFraction
+        height: parent.height
+        radius: parent.radius
+        color: Color.accent
+        opacity: root.selectedJob ? 0.66 : 0
+        clip: true
+
+        Behavior on width {
+          NumberAnimation { duration: 360; easing.type: Easing.OutCubic }
+        }
+
+        // Fronts travel at a fixed visual velocity. They are independent
+        // instances, so a producer can outpace the crossing time: at 10 Hz
+        // several waves coexist instead of repeatedly resetting one wave.
+        property int nextWaveToken: 0
+        ListModel { id: waveFronts }
+        function launchWaves(count) {
+          for (var i = 0; i < count; i++)
+            waveFronts.append({ token: nextWaveToken++ })
+        }
+        function retireWave(token) {
+          for (var i = 0; i < waveFronts.count; i++) {
+            if (waveFronts.get(i).token === token) {
+              waveFronts.remove(i)
+              return
+            }
+          }
+        }
+
+        Repeater {
+          model: waveFronts
+          delegate: Rectangle {
+            id: front
+            required property int token
+            z: 1
+            width: Style.space(72)
+            height: fill.height
+            x: -width
+            opacity: 0.9
+            gradient: Gradient {
+              orientation: Gradient.Horizontal
+              GradientStop { position: 0.0; color: "transparent" }
+              GradientStop { position: 0.42; color: Qt.rgba(1, 1, 1, 0.06) }
+              GradientStop { position: 0.70; color: Qt.rgba(1, 1, 1, 0.24) }
+              GradientStop { position: 0.88; color: Qt.rgba(1, 1, 1, 0.96) }
+              GradientStop { position: 0.93; color: Qt.rgba(1, 1, 1, 0.96) }
+              GradientStop { position: 1.0; color: "transparent" }
+            }
+            Component.onCompleted: travel.start()
+            NumberAnimation {
+              id: travel
+              // A bare `parent` here resolves through the delegate to the
+              // anchored fill, which cannot move; name the front explicitly.
+              target: front
+              property: "x"
+              from: -front.width
+              to: fill.width
+              duration: Math.max(180, Math.round((fill.width + front.width) * 4))
+              easing.type: Easing.Linear
+              onStopped: fill.retireWave(token)
+            }
+          }
+        }
+      }
+    }
+
+    Text {
+      anchors.centerIn: parent
+      z: 1
+      text: root.label
+      textFormat: Text.PlainText
+      color: root.bar.barForeground
+      font.family: root.bar.fontFamily
+      font.pixelSize: Style.font.body
+      // Regular weight and default rendering, like Dual City's city names:
+      // at 1.5x, bold native rendering fills in the eye of the "e".
+    }
+  }
+
+  PopupCard {
+    id: popup
+    anchorItem: root
+    bar: root.bar
+    owner: root
+    open: root.popupOpen
+    // PopupWindow leaves keyboard focus with the previous app unless this is
+    // enabled. The picker needs that focus for arrow and I/K navigation.
+    grabFocus: root.popupOpen
+    contentWidth: popup.fittedContentWidth(Style.space(330))
+    contentHeight: popup.fittedContentHeight(content.implicitHeight)
+
+    Column {
+      id: content
+      anchors.fill: parent
+      spacing: Style.space(6)
+      focus: root.popupOpen
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_Up || event.key === Qt.Key_I) {
+          root.selectRelative(-1)
+          event.accepted = true
+        } else if (event.key === Qt.Key_Down || event.key === Qt.Key_K) {
+          root.selectRelative(1)
+          event.accepted = true
+        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space || event.key === Qt.Key_Escape) {
+          root.close()
+          event.accepted = true
+        }
+      }
+
+      Text {
+        text: "Work Progress"
+        color: root.bar.foreground
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+      }
+
+      Text {
+        visible: root.jobs.length === 0
+        text: "No active work"
+        color: Qt.darker(root.bar.foreground, 1.5)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Repeater {
+        model: root.jobs
+
+        delegate: Rectangle {
+          required property var modelData
+          readonly property var job: modelData
+          readonly property bool selected: String(job.id || "") === root.selectedId
+          width: content.width
+          height: Style.space(42)
+          radius: Style.space(3)
+          color: Style.normalFillFor(root.bar.foreground, Color.accent)
+          clip: true
+          border.width: selected ? 2 : 1
+          border.color: selected ? Color.accent : Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.14)
+
+          Rectangle {
+            id: rowFill
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width * root.jobFraction(parent.job)
+            height: parent.height
+            radius: parent.radius
+            color: Color.accent
+            opacity: parent.selected ? 0.8 : 0.56
+            clip: true
+
+            Behavior on width {
+              NumberAnimation { duration: 360; easing.type: Easing.OutCubic }
+            }
+
+            property int nextWaveToken: 0
+            ListModel { id: rowWaveFronts }
+            function launchWaves(count) {
+              for (var i = 0; i < count; i++)
+                rowWaveFronts.append({ token: nextWaveToken++ })
+            }
+            function retireWave(token) {
+              for (var i = 0; i < rowWaveFronts.count; i++) {
+                if (rowWaveFronts.get(i).token === token) {
+                  rowWaveFronts.remove(i)
+                  return
+                }
+              }
+            }
+            Repeater {
+              model: rowWaveFronts
+              delegate: Rectangle {
+                id: front
+                required property int token
+                z: 1
+                width: Style.space(72)
+                height: rowFill.height
+                x: -width
+                opacity: 0.9
+                gradient: Gradient {
+                  orientation: Gradient.Horizontal
+                  GradientStop { position: 0.0; color: "transparent" }
+                  GradientStop { position: 0.42; color: Qt.rgba(1, 1, 1, 0.06) }
+                  GradientStop { position: 0.70; color: Qt.rgba(1, 1, 1, 0.24) }
+                  GradientStop { position: 0.88; color: Qt.rgba(1, 1, 1, 0.96) }
+                  GradientStop { position: 0.93; color: Qt.rgba(1, 1, 1, 0.96) }
+                  GradientStop { position: 1.0; color: "transparent" }
+                }
+                Component.onCompleted: travel.start()
+                NumberAnimation {
+                  id: travel
+                  target: front
+                  property: "x"
+                  from: -front.width
+                  to: rowFill.width
+                  duration: Math.max(180, Math.round((rowFill.width + front.width) * 4))
+                  easing.type: Easing.Linear
+                  onStopped: rowFill.retireWave(token)
+                }
+              }
+            }
+          }
+
+          Connections {
+            target: root
+            function onAdvanceCountsChanged() {
+              var count = Number(root.advanceCounts[String(job.id || "")] || 0)
+              if (count > 0)
+                Qt.callLater(function() { rowFill.launchWaves(count) })
+            }
+          }
+
+          Text {
+            anchors.left: parent.left
+            anchors.right: progress.left
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(8)
+            text: String(job.title || job.id || "Work")
+            textFormat: Text.PlainText
+            elide: Text.ElideRight
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+
+          Text {
+            id: progress
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.rightMargin: Style.space(10)
+            text: root.progressText(job)
+            textFormat: Text.PlainText
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.selectJob(String(parent.job.id || ""))
+          }
+        }
+      }
+    }
+  }
+}
