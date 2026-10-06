@@ -14,6 +14,10 @@ BarWidget {
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string progressDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/agent-progress"
   property var jobs: []
+  // Picker rows are keyed by ID, and this list only changes when jobs start
+  // or end. Rebuilding rows on every update (10 a second from a pipe) would
+  // reset their particles and fronts before they crossed the row.
+  property var activeIds: []
   property var jobIds: []
   property var progressSnapshot: ({})
   // Counts, rather than a boolean, preserve every progress unit that arrived
@@ -21,6 +25,17 @@ BarWidget {
   // distinct fronts without being visually rate-limited to one.
   property var advanceCounts: ({})
   property bool hasProgressSnapshot: false
+  // Recent (time, current) samples per job, and the throughput derived from
+  // them in steps (or bytes) per second.
+  property var progressSamples: ({})
+  property var rates: ({})
+  // Jobs drawn as a continuous wavelet stream rather than one front per step.
+  property var streamingIds: ({})
+  // One front per step reads well up to a few dozen steps a second; past
+  // that, fronts would merge into a solid sheen, so the meter streams.
+  readonly property real streamEnterRate: 25
+  readonly property real streamExitRate: 12
+  readonly property int maximumFrontsPerUpdate: 8
   property string selectedId: ""
   property bool popupOpen: false
   property bool pickerKeysRequested: false
@@ -45,11 +60,62 @@ BarWidget {
 
   readonly property real progressFraction: jobFraction(selectedJob)
 
+  function jobById(id) {
+    for (var i = 0; i < jobs.length; i++) {
+      if (String(jobs[i].id || "") === id) return jobs[i]
+    }
+    return { id: id }
+  }
+
+  function isBytes(job) {
+    return !!job && String(job.unit || "") === "bytes"
+  }
+
+  // Decimal units, scaled to `reference` so a pair reads "1.2/4.8 GB".
+  readonly property var byteUnits: ["B", "KB", "MB", "GB", "TB"]
+  function byteExponent(reference) {
+    return reference < 1000 ? 0 : Math.min(4, Math.floor(Math.log(reference) / Math.log(1000)))
+  }
+  function byteValue(bytes, exponent) {
+    var value = bytes / Math.pow(1000, exponent)
+    return exponent === 0 || value >= 10 ? String(Math.round(value)) : value.toFixed(1)
+  }
+  function formatBytes(bytes) {
+    var exponent = byteExponent(bytes)
+    return byteValue(bytes, exponent) + " " + byteUnits[exponent]
+  }
+
   function progressText(job) {
     var current = Number(job.current || 0)
     var total = job.total === null || job.total === undefined ? null : Number(job.total)
-    if (total !== null && total > 0) return String(current) + "/" + String(total) + " · " + String(Math.round(current * 100 / total)) + "%"
+    var percent = total !== null && total > 0 ? " · " + String(Math.round(current * 100 / total)) + "%" : ""
+    if (isBytes(job)) {
+      if (!percent) return current > 0 ? formatBytes(current) : "working"
+      var exponent = byteExponent(total)
+      return byteValue(current, exponent) + "/" + byteValue(total, exponent) + " " + byteUnits[exponent] + percent
+    }
+    if (percent) return String(current) + "/" + String(total) + percent
     return current > 0 ? String(current) + (job.unit ? " " + String(job.unit) : "") : "working"
+  }
+
+  function rateText(job) {
+    var rate = Number(rates[String(job.id || "")] || 0)
+    if (rate <= 0) return ""
+    if (isBytes(job)) return formatBytes(rate) + "/s"
+    return String(Math.round(rate)) + " " + String(job.unit || "items") + "/s"
+  }
+
+  function isStreaming(job) {
+    return !!job && streamingIds[String(job.id || "")] === true
+  }
+
+  // 0 at a trickle, 1 flat out, on a log scale: 10 KB/s to 100 MB/s for
+  // bytes, 25 to 2,500 steps a second otherwise.
+  function streamIntensity(job) {
+    var rate = Number(rates[String(job ? job.id || "" : "")] || 0)
+    if (rate <= 0) return 0
+    var level = isBytes(job) ? (Math.log(rate) / Math.LN10 - 4) / 4 : (Math.log(rate) / Math.LN10 - 1.4) / 2
+    return Math.max(0, Math.min(1, level))
   }
 
   // The slot is intentionally permanent. A job starting never shifts the
@@ -134,7 +200,8 @@ BarWidget {
       var job = jobs[i]
       var title = String(job.title || job.id || "Work")
       var detail = job.detail ? " — " + String(job.detail) : ""
-      lines.push(title + ": " + progressText(job) + detail)
+      var rate = rateText(job)
+      lines.push(title + ": " + progressText(job) + (rate ? " · " + rate : "") + detail)
     }
     return lines.join("\n")
   }
@@ -186,12 +253,18 @@ BarWidget {
         if (hasProgressSnapshot && progressSnapshot[id] !== undefined && current > Number(progressSnapshot[id]))
           advances[id] = current - Number(progressSnapshot[id])
         nextSnapshot[id] = current
+        if (progressSnapshot[id] === undefined || current !== Number(progressSnapshot[id])) {
+          if (!progressSamples[id]) progressSamples[id] = []
+          progressSamples[id].push([Date.now(), current])
+        }
       }
     }
     active.sort(function(a, b) {
       return String(a.startedAt || "").localeCompare(String(b.startedAt || ""))
     })
     jobs = active
+    var ids = active.map(function(record) { return String(record.id || "") })
+    if (JSON.stringify(ids) !== JSON.stringify(activeIds)) activeIds = ids
 
     var selectedStillActive = false
     for (var j = 0; j < jobs.length; j++) {
@@ -201,9 +274,45 @@ BarWidget {
 
     progressSnapshot = nextSnapshot
     advanceCounts = advances
-    if (hasProgressSnapshot && Number(advances[selectedId] || 0) > 0)
+    if (hasProgressSnapshot && Number(advances[selectedId] || 0) > 0 && !isStreaming(selectedJob))
       Qt.callLater(function() { fill.launchWaves(Number(advances[selectedId])) })
     hasProgressSnapshot = true
+  }
+
+  // Throughput over the last two seconds, and the stream/front choice with
+  // hysteresis so a job near the threshold doesn't flicker between modes.
+  function updateRates() {
+    var now = Date.now()
+    var nextRates = {}
+    var nextStreaming = {}
+    var nextSamples = {}
+    for (var i = 0; i < jobs.length; i++) {
+      var job = jobs[i]
+      var id = String(job.id || "")
+      var samples = (progressSamples[id] || []).filter(function(sample) { return now - sample[0] <= 2000 })
+      nextSamples[id] = samples
+      // Measured to now, not to the latest sample, so a stalled job's rate
+      // falls away instead of holding its last speed.
+      var rate = 0
+      if (samples.length > 1) {
+        var oldest = samples[0]
+        var latest = samples[samples.length - 1]
+        rate = Math.max(0, (latest[1] - oldest[1]) / Math.max(0.25, (now - oldest[0]) / 1000))
+      }
+      nextRates[id] = rate
+      var wasStreaming = streamingIds[id] === true
+      nextStreaming[id] = isBytes(job) || (wasStreaming ? rate > streamExitRate : rate > streamEnterRate)
+    }
+    progressSamples = nextSamples
+    rates = nextRates
+    streamingIds = nextStreaming
+  }
+
+  Timer {
+    interval: 250
+    running: root.jobs.length > 0
+    repeat: true
+    onTriggered: root.updateRates()
   }
 
   function refresh() {
@@ -382,7 +491,7 @@ BarWidget {
         property int nextWaveToken: 0
         ListModel { id: waveFronts }
         function launchWaves(count) {
-          for (var i = 0; i < count; i++)
+          for (var i = 0; i < Math.min(count, root.maximumFrontsPerUpdate); i++)
             waveFronts.append({ token: nextWaveToken++ })
         }
         function retireWave(token) {
@@ -427,6 +536,14 @@ BarWidget {
               onStopped: fill.retireWave(token)
             }
           }
+        }
+
+        PixelStream {
+          anchors.fill: parent
+          z: 1
+          flowing: root.isStreaming(root.selectedJob) && Number(root.rates[root.selectedId] || 0) > 0
+          intensity: root.streamIntensity(root.selectedJob)
+          color: root.bar.background
         }
       }
     }
@@ -492,11 +609,11 @@ BarWidget {
       }
 
       Repeater {
-        model: root.jobs
+        model: root.activeIds
 
         delegate: Rectangle {
           required property var modelData
-          readonly property var job: modelData
+          readonly property var job: root.jobById(modelData)
           readonly property bool selected: String(job.id || "") === root.selectedId
           width: content.width
           height: Style.space(42)
@@ -524,7 +641,7 @@ BarWidget {
             property int nextWaveToken: 0
             ListModel { id: rowWaveFronts }
             function launchWaves(count) {
-              for (var i = 0; i < count; i++)
+              for (var i = 0; i < Math.min(count, root.maximumFrontsPerUpdate); i++)
                 rowWaveFronts.append({ token: nextWaveToken++ })
             }
             function retireWave(token) {
@@ -567,13 +684,21 @@ BarWidget {
                 }
               }
             }
+
+            PixelStream {
+              anchors.fill: parent
+              z: 1
+              flowing: root.isStreaming(job) && Number(root.rates[String(job.id || "")] || 0) > 0
+              intensity: root.streamIntensity(job)
+              color: root.bar.background
+            }
           }
 
           Connections {
             target: root
             function onAdvanceCountsChanged() {
               var count = Number(root.advanceCounts[String(job.id || "")] || 0)
-              if (count > 0)
+              if (count > 0 && !root.isStreaming(job))
                 Qt.callLater(function() { rowFill.launchWaves(count) })
             }
           }

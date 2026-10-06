@@ -15,6 +15,10 @@ or a running count instead of a percentage. Never invent progress.
 
 ## How
 
+Pick the mode by how fast the work moves.
+
+**A step every second or slower** (parts, files, plan items):
+
 ```bash
 agent-progress start <id> --title "Rebuilding CAD parts" --total 12 --unit parts
 agent-progress update <id> --current 3 --detail "bracket.step"
@@ -22,12 +26,36 @@ agent-progress finish <id>                    # success
 agent-progress fail <id> --detail "why"       # failure
 ```
 
+**Many fast steps**: one `pipe` process instead of an `update` per step
+(each `update` costs ~70 ms). Print one line per finished step into it:
+
+```bash
+for f in "${files[@]}"; do convert_one "$f"; echo; done \
+  | agent-progress pipe <id> --title "Converting files" --total ${#files[@]} >/dev/null
+```
+
+**Downloads, uploads, copies, archives**: put `pipe --bytes` in the data path.
+It passes data through unchanged and the bar shows MB/GB, speed in the
+tooltip, and a stream of particles that follows the throughput:
+
+```bash
+curl -sL "$url" | agent-progress pipe <id> --bytes --title "Downloading model" --total "$size" > model.bin
+tar c build/ | agent-progress pipe <id> --bytes --title "Uploading build" | ssh host 'tar x'
+```
+
+`pipe` starts the job itself and ends it: `finish` when input ends, `fail` if
+it ends short of `--total`, the output closes, or it's interrupted. It can't
+see whether the command feeding it succeeded; use `set -o pipefail` and run
+`agent-progress fail <id>` if the pipeline fails.
+
 - `<id>`: lowercase, digits, `.`, `_`, `-`; prefix it with your agent name so
   sessions never collide, e.g. `claude-cad-rebuild`, `codex-theme-render`.
 - `--title`: short. The bar slot is narrow and shows the count, not the
   title; the title appears in the tooltip and the Super+P picker.
-- Update after each step. High rates are fine (10/s is tested); each increment
-  draws one wave on the meter, so don't batch updates artificially.
+- Titles and details describe the work, never the user's data: "Verifying
+  photo backup", not a filename, person or place from their files.
+- Report every step; don't batch artificially. The bar draws one wave per
+  step for slow jobs and switches to a particle stream for fast ones.
 - Waiting on the user? `agent-progress update <id> --state blocked --detail
   "needs approval"`, then `--state running` when you resume.
 

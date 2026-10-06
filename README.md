@@ -10,12 +10,19 @@ terminal doing the work is out of sight.
 - **Every step is visible.** Each time progress moves, a wave runs along the
   fill. Fast work sends several waves at once, so you can tell 1 step a second
   from 10 at a glance.
+- **Transfers flow.** Downloads, uploads and copies show as a stream of
+  particles that speeds up and thickens with throughput, thins to a trickle,
+  and stops when the transfer stalls. Byte jobs read in MB and GB, with the
+  speed in the tooltip. Particles take the bar's background colour, so the
+  label on top stays readable in light and dark themes.
 - **Several jobs at once.** The bar shows one job at a time. Click the meter
   or press Super+P to pick another; arrow keys (or I/K) move through the
   list, and Return or Escape closes it.
 - **Fits the space it has.** Placed just before the bar's centre widget, the
   meter grows to fill the gap back to your workspaces and shrinks when that gap
   narrows. When it gets tight, the label drops to just the percentage.
+
+![A transfer streaming particles along the meter: a fast burst, a slowdown, a stall, then recovery](docs/stream.gif)
 
 ![The job picker listing three jobs with their progress](docs/picker.png)
 
@@ -56,8 +63,20 @@ agent-progress finish photo-import        # or: agent-progress fail photo-import
 | `update <id>` | Changes `--current`, `--total`, `--title`, `--detail`, `--unit` or `--state` |
 | `finish <id>` | Marks the job done and takes it off the bar |
 | `fail <id>` | Marks the job failed and takes it off the bar |
+| `pipe <id>` | Passes stdin to stdout and counts lines, or bytes with `--bytes`; starts and ends the job itself |
 | `list` | Shows active jobs (`--json` for scripts) |
 | `remove <id>` | Deletes a job's record |
+
+For transfers and fast loops, use `pipe`: one process for the whole job
+instead of a command per step.
+
+```bash
+curl -sL "$url" | agent-progress pipe model --bytes --title "Downloading model" --total "$size" > model.bin
+for f in *.raw; do convert "$f"; echo; done | agent-progress pipe convert --total 900 > /dev/null
+```
+
+`pipe` finishes the job when its input ends, and fails it if the input ends
+short of `--total`, the output closes, or it's interrupted.
 
 Leave out `--total` when there is nothing to count against; the meter then
 shows a running count, or "working". `--state blocked` marks a job that is

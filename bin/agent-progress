@@ -13,8 +13,9 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
-import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -56,13 +57,16 @@ def read_job(job_id: str) -> dict:
 
 def write_job(record: dict) -> None:
     path = job_path(str(record["id"]))
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{record['id']}.", suffix=".tmp", dir=path.parent)
+    # A per-process name in the same directory, created exclusively; cheaper
+    # than importing tempfile, which costs ~12 ms of startup.
+    temporary = path.with_name(f".{record['id']}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(record, handle, separators=(",", ":"), sort_keys=True)
             handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        # No fsync: records are disposable status, and the rename alone keeps
+        # readers from seeing a half-written file. Syncing cost ~85 ms a write.
         os.replace(temporary, path)
     finally:
         try:
@@ -134,6 +138,80 @@ def fail(args: argparse.Namespace) -> None:
     write_job(record)
 
 
+def pipe(args: argparse.Namespace) -> None:
+    """Pass stdin to stdout unchanged, counting what flows through.
+
+    One long-lived process replaces an `update` per step: it counts bytes
+    (--bytes) or lines, and publishes at most ten records a second. The bar
+    turns each jump into the right amount of motion, so nothing is lost by
+    coalescing.
+    """
+    now = timestamp()
+    record = {
+        "version": 1,
+        "id": args.id,
+        "title": args.title or args.id.replace("-", " ").replace("_", " ").title(),
+        "state": "running",
+        "current": 0,
+        "total": args.total,
+        "unit": args.unit or ("bytes" if args.bytes else "items"),
+        "detail": args.detail or "",
+        "startedAt": now,
+        "updatedAt": now,
+    }
+    validate_numbers(record)
+    write_job(record)
+
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupted)
+    source, sink = sys.stdin.buffer, sys.stdout.buffer
+    count = 0
+    published = time.monotonic()
+
+    def publish(force: bool = False) -> None:
+        nonlocal published
+        moment = time.monotonic()
+        if force or moment - published >= 0.1:
+            record["current"] = count if args.total is None else min(count, args.total)
+            record["updatedAt"] = timestamp()
+            write_job(dict(record))
+            published = moment
+
+    def end(state: str, detail: str | None) -> None:
+        record["state"] = state
+        if detail is not None:
+            record["detail"] = detail
+        publish(force=True)
+
+    try:
+        if args.bytes:
+            while chunk := source.read1(1 << 20):
+                sink.write(chunk)
+                count += len(chunk)
+                publish()
+        else:
+            for line in source:
+                sink.write(line)
+                count += 1
+                publish()
+        sink.flush()
+    except BrokenPipeError:
+        # Point stdout at /dev/null so the interpreter's exit flush is quiet.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        end("failed", "Output closed early")
+        raise SystemExit(1)
+    except KeyboardInterrupt:
+        end("failed", "Interrupted")
+        raise SystemExit(130)
+
+    if args.total is not None and count < args.total:
+        end("failed", f"Ended early: {count} of {args.total} {record['unit']}")
+        raise SystemExit(1)
+    end("completed", args.detail)
+
+
 def remove(args: argparse.Namespace) -> None:
     try:
         job_path(args.id).unlink()
@@ -194,6 +272,15 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("id")
     command.add_argument("--detail")
     command.set_defaults(handler=fail)
+
+    command = commands.add_parser("pipe", help="report data flowing from stdin to stdout")
+    command.add_argument("id")
+    command.add_argument("--title", help="short bar/popup title")
+    command.add_argument("--total", type=int, help="expected bytes or lines")
+    command.add_argument("--unit", help="unit name (default: bytes or items)")
+    command.add_argument("--detail", help="short status detail")
+    command.add_argument("--bytes", action="store_true", help="count bytes instead of lines")
+    command.set_defaults(handler=pipe)
 
     command = commands.add_parser("remove", help="remove a job record")
     command.add_argument("id")

@@ -27,10 +27,12 @@ Item {
   // File-system notifications can coalesce under a high-rate producer. This
   // small reconciliation read retains the current record even when one event
   // is missed; BarWidget derives the number of wave fronts from the progress
-  // delta, so no pulse is lost.
+  // delta, so no pulse is lost. Finished records stop polling; the file
+  // watch still notices if the job is started again.
+  readonly property bool active: !record || ["running", "paused", "blocked"].indexOf(String(record.state || "")) !== -1
   Timer {
     interval: 120
-    running: root.path !== ""
+    running: root.path !== "" && root.active
     repeat: true
     triggeredOnStart: true
     onTriggered: jobFile.reload()

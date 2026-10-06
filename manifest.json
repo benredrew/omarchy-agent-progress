@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "benredrew.progress",
   "name": "Work Progress",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "benredrew",
   "description": "Shows active agent and background-work progress in the bar",
   "kinds": ["bar-widget"],
