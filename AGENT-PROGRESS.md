@@ -64,6 +64,11 @@ see whether the command feeding it succeeded; use `set -o pipefail` and run
 - **Always end the job**: `finish` or `fail`, including when you are
   interrupted, stop early, or hit an error. A job left `running` stays on the
   bar forever.
+- **Run it in the background.** Work long enough to report here runs as a
+  background command, not in your foreground turn: the bar is how the user
+  watches it, and the conversation stays free meanwhile. Put `start`,
+  `update` and `finish` (or `pipe`) inside the backgrounded script, `fail` on
+  error, and act on the job when it completes.
 - Only touch jobs you started. Other agents share the same directory.
 - Records live in `~/.local/state/agent-progress/<id>.json`; finished ones are
   hidden but kept. `agent-progress list` shows what is active.
