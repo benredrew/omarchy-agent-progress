@@ -142,7 +142,7 @@ def pipe(args: argparse.Namespace) -> None:
     """Pass stdin to stdout unchanged, counting what flows through.
 
     One long-lived process replaces an `update` per step: it counts bytes
-    (--bytes) or lines, and publishes at most ten records a second. The bar
+    (--bytes) or lines, and publishes at most four records a second. The bar
     turns each jump into the right amount of motion, so nothing is lost by
     coalescing.
     """
@@ -169,11 +169,16 @@ def pipe(args: argparse.Namespace) -> None:
     source, sink = sys.stdin.buffer, sys.stdout.buffer
     count = 0
     published = time.monotonic()
+    # Four records a second. Each costs the bar a file read and a rebuild,
+    # and the bar glides between them at 30 Hz, so publishing faster looks
+    # the same and costs both sides CPU (30 a second roughly tripled it; a
+    # write per chunk took about half a core).
+    interval = 0.25
 
     def publish(force: bool = False) -> None:
         nonlocal published
         moment = time.monotonic()
-        if force or moment - published >= 0.1:
+        if force or moment - published >= interval:
             record["current"] = count if args.total is None else min(count, args.total)
             record["updatedAt"] = timestamp()
             write_job(dict(record))

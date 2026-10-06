@@ -275,7 +275,7 @@ BarWidget {
     progressSnapshot = nextSnapshot
     advanceCounts = advances
     if (hasProgressSnapshot && Number(advances[selectedId] || 0) > 0 && !isStreaming(selectedJob))
-      Qt.callLater(function() { fill.launchWaves(Number(advances[selectedId])) })
+      Qt.callLater(function() { motion.launchFronts(Math.min(Number(advances[selectedId]), root.maximumFrontsPerUpdate)) })
     hasProgressSnapshot = true
   }
 
@@ -314,6 +314,31 @@ BarWidget {
     repeat: true
     onTriggered: root.updateRates()
   }
+
+  // The one animation clock for the meter and the picker rows. Every Motion
+  // steps on its tick, so the bar redraws at most 30 times a second however
+  // many things move, and not at all when nothing does.
+  Item {
+    id: animationClock
+    signal ticked(real dt)
+    property int busy: 0
+    property real lastTick: 0
+    Timer {
+      interval: 33
+      repeat: true
+      running: animationClock.busy > 0
+      onRunningChanged: animationClock.lastTick = Date.now()
+      onTriggered: {
+        var now = Date.now()
+        var dt = Math.min((now - animationClock.lastTick) / 1000, 0.1)
+        animationClock.lastTick = now
+        animationClock.ticked(dt)
+      }
+    }
+  }
+
+  // Switching jobs shows the new job's fill at once rather than gliding.
+  onSelectedIdChanged: Qt.callLater(function() { motion.snap() })
 
   function refresh() {
     if (!listProcess.running) listProcess.running = true
@@ -474,73 +499,19 @@ BarWidget {
         id: fill
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
-        width: parent.width * root.progressFraction
+        width: parent.width * motion.shown
         height: parent.height
         radius: parent.radius
         color: Color.accent
         opacity: root.selectedJob ? 0.66 : 0
         clip: true
 
-        Behavior on width {
-          NumberAnimation { duration: 360; easing.type: Easing.OutCubic }
-        }
-
-        // Fronts travel at a fixed visual velocity. They are independent
-        // instances, so a producer can outpace the crossing time: at 10 Hz
-        // several waves coexist instead of repeatedly resetting one wave.
-        property int nextWaveToken: 0
-        ListModel { id: waveFronts }
-        function launchWaves(count) {
-          for (var i = 0; i < Math.min(count, root.maximumFrontsPerUpdate); i++)
-            waveFronts.append({ token: nextWaveToken++ })
-        }
-        function retireWave(token) {
-          for (var i = 0; i < waveFronts.count; i++) {
-            if (waveFronts.get(i).token === token) {
-              waveFronts.remove(i)
-              return
-            }
-          }
-        }
-
-        Repeater {
-          model: waveFronts
-          delegate: Rectangle {
-            id: front
-            required property int token
-            z: 1
-            width: Style.space(72)
-            height: fill.height
-            x: -width
-            opacity: 0.9
-            gradient: Gradient {
-              orientation: Gradient.Horizontal
-              GradientStop { position: 0.0; color: "transparent" }
-              GradientStop { position: 0.42; color: Qt.rgba(1, 1, 1, 0.06) }
-              GradientStop { position: 0.70; color: Qt.rgba(1, 1, 1, 0.24) }
-              GradientStop { position: 0.88; color: Qt.rgba(1, 1, 1, 0.96) }
-              GradientStop { position: 0.93; color: Qt.rgba(1, 1, 1, 0.96) }
-              GradientStop { position: 1.0; color: "transparent" }
-            }
-            Component.onCompleted: travel.start()
-            NumberAnimation {
-              id: travel
-              // A bare `parent` here resolves through the delegate to the
-              // anchored fill, which cannot move; name the front explicitly.
-              target: front
-              property: "x"
-              from: -front.width
-              to: fill.width
-              duration: Math.max(180, Math.round((fill.width + front.width) * 4))
-              easing.type: Easing.Linear
-              onStopped: fill.retireWave(token)
-            }
-          }
-        }
-
-        PixelStream {
+        Motion {
+          id: motion
           anchors.fill: parent
           z: 1
+          clock: animationClock
+          target: root.progressFraction
           flowing: root.isStreaming(root.selectedJob) && Number(root.rates[root.selectedId] || 0) > 0
           intensity: root.streamIntensity(root.selectedJob)
           color: root.bar.background
@@ -627,67 +598,22 @@ BarWidget {
             id: rowFill
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
-            width: parent.width * root.jobFraction(parent.job)
+            width: parent.width * rowMotion.shown
             height: parent.height
             radius: parent.radius
             color: Color.accent
             opacity: parent.selected ? 0.8 : 0.56
             clip: true
 
-            Behavior on width {
-              NumberAnimation { duration: 360; easing.type: Easing.OutCubic }
-            }
-
-            property int nextWaveToken: 0
-            ListModel { id: rowWaveFronts }
-            function launchWaves(count) {
-              for (var i = 0; i < Math.min(count, root.maximumFrontsPerUpdate); i++)
-                rowWaveFronts.append({ token: nextWaveToken++ })
-            }
-            function retireWave(token) {
-              for (var i = 0; i < rowWaveFronts.count; i++) {
-                if (rowWaveFronts.get(i).token === token) {
-                  rowWaveFronts.remove(i)
-                  return
-                }
-              }
-            }
-            Repeater {
-              model: rowWaveFronts
-              delegate: Rectangle {
-                id: front
-                required property int token
-                z: 1
-                width: Style.space(72)
-                height: rowFill.height
-                x: -width
-                opacity: 0.9
-                gradient: Gradient {
-                  orientation: Gradient.Horizontal
-                  GradientStop { position: 0.0; color: "transparent" }
-                  GradientStop { position: 0.42; color: Qt.rgba(1, 1, 1, 0.06) }
-                  GradientStop { position: 0.70; color: Qt.rgba(1, 1, 1, 0.24) }
-                  GradientStop { position: 0.88; color: Qt.rgba(1, 1, 1, 0.96) }
-                  GradientStop { position: 0.93; color: Qt.rgba(1, 1, 1, 0.96) }
-                  GradientStop { position: 1.0; color: "transparent" }
-                }
-                Component.onCompleted: travel.start()
-                NumberAnimation {
-                  id: travel
-                  target: front
-                  property: "x"
-                  from: -front.width
-                  to: rowFill.width
-                  duration: Math.max(180, Math.round((rowFill.width + front.width) * 4))
-                  easing.type: Easing.Linear
-                  onStopped: rowFill.retireWave(token)
-                }
-              }
-            }
-
-            PixelStream {
+            Motion {
+              id: rowMotion
               anchors.fill: parent
               z: 1
+              clock: animationClock
+              target: root.jobFraction(job)
+              // A closed picker's window is hidden, but its animations would
+              // keep ticking; only animate rows while it is open.
+              visible: root.popupOpen
               flowing: root.isStreaming(job) && Number(root.rates[String(job.id || "")] || 0) > 0
               intensity: root.streamIntensity(job)
               color: root.bar.background
@@ -698,8 +624,8 @@ BarWidget {
             target: root
             function onAdvanceCountsChanged() {
               var count = Number(root.advanceCounts[String(job.id || "")] || 0)
-              if (count > 0 && !root.isStreaming(job))
-                Qt.callLater(function() { rowFill.launchWaves(count) })
+              if (count > 0 && root.popupOpen && !root.isStreaming(job))
+                Qt.callLater(function() { rowMotion.launchFronts(Math.min(count, root.maximumFrontsPerUpdate)) })
             }
           }
 
