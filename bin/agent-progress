@@ -84,8 +84,31 @@ def validate_numbers(record: dict) -> None:
         raise ValueError("current cannot exceed total")
 
 
+# Display names for agents that announce themselves, by name prefix.
+AGENT_NAMES = {"claude": "Claude", "codex": "Codex", "opencode": "opencode", "gemini": "Gemini"}
+
+
+def agent_name(job_id: str, explicit: str | None = None) -> str | None:
+    """Who is reporting: --agent, then the environment, then the ID prefix."""
+    if explicit:
+        return explicit
+    # AI_AGENT is a cross-tool convention, e.g. "claude-code_2-1-288_agent".
+    hint = os.environ.get("AI_AGENT", "")
+    if not hint:
+        if os.environ.get("CLAUDECODE"):
+            hint = "claude"
+        elif any(key.startswith("CODEX_") for key in os.environ):
+            hint = "codex"
+        elif any(key.startswith("OPENCODE") for key in os.environ):
+            hint = "opencode"
+    for prefix, name in AGENT_NAMES.items():
+        if hint.lower().startswith(prefix) or (not hint and job_id.startswith(prefix + "-")):
+            return name
+    return hint.split("_")[0] or None
+
+
 def update_record(record: dict, args: argparse.Namespace) -> dict:
-    for field in ("title", "detail", "unit", "current", "total", "state"):
+    for field in ("title", "detail", "unit", "current", "total", "state", "agent"):
         value = getattr(args, field, None)
         if value is not None:
             record[field] = value
@@ -110,6 +133,9 @@ def start(args: argparse.Namespace) -> None:
         "startedAt": now,
         "updatedAt": now,
     }
+    agent = agent_name(args.id, args.agent)
+    if agent:
+        record["agent"] = agent
     validate_numbers(record)
     write_job(record)
 
@@ -159,6 +185,9 @@ def pipe(args: argparse.Namespace) -> None:
         "startedAt": now,
         "updatedAt": now,
     }
+    agent = agent_name(args.id, args.agent)
+    if agent:
+        record["agent"] = agent
     validate_numbers(record)
     write_job(record)
 
@@ -252,6 +281,7 @@ def parser() -> argparse.ArgumentParser:
     def job_options(command: argparse.ArgumentParser, include_title: bool = False) -> None:
         if include_title:
             command.add_argument("--title", help="short bar/popup title")
+            command.add_argument("--agent", help="who is reporting (default: detected, e.g. Claude or Codex)")
         command.add_argument("--current", type=int, help="completed items")
         command.add_argument("--total", type=int, help="total items")
         command.add_argument("--unit", help="item unit, such as photos or files")
@@ -281,6 +311,7 @@ def parser() -> argparse.ArgumentParser:
     command = commands.add_parser("pipe", help="report data flowing from stdin to stdout")
     command.add_argument("id")
     command.add_argument("--title", help="short bar/popup title")
+    command.add_argument("--agent", help="who is reporting (default: detected, e.g. Claude or Codex)")
     command.add_argument("--total", type=int, help="expected bytes or lines")
     command.add_argument("--unit", help="unit name (default: bytes or items)")
     command.add_argument("--detail", help="short status detail")

@@ -52,6 +52,9 @@ see whether the command feeding it succeeded; use `set -o pipefail` and run
   sessions never collide, e.g. `claude-cad-rebuild`, `codex-theme-render`.
 - `--title`: short. The bar slot is narrow and shows the count, not the
   title; the title appears in the tooltip and the Super+P picker.
+- The picker shows which agent reported each job. It is detected from your
+  environment (Claude Code, Codex, opencode); if the picker would show the
+  wrong name, pass `--agent` to `start` or `pipe`.
 - Titles and details describe the work, never the user's data: "Verifying
   photo backup", not a filename, person or place from their files.
 - Report every step; don't batch artificially. The bar draws one wave per

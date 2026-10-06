@@ -629,19 +629,36 @@ BarWidget {
             }
           }
 
-          Text {
+          // Title, and below it the agent that reported the job, when known.
+          Column {
             anchors.left: parent.left
             anchors.right: progress.left
             anchors.verticalCenter: parent.verticalCenter
             anchors.leftMargin: Style.space(10)
             anchors.rightMargin: Style.space(8)
-            text: String(job.title || job.id || "Work")
-            textFormat: Text.PlainText
-            elide: Text.ElideRight
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            font.bold: true
+
+            Text {
+              width: parent.width
+              text: String(job.title || job.id || "Work")
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              visible: text !== ""
+              text: String(job.agent || "")
+              textFormat: Text.PlainText
+              elide: Text.ElideRight
+              color: root.bar.foreground
+              opacity: 0.7
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
 
           Text {

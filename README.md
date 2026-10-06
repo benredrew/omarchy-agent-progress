@@ -17,7 +17,8 @@ terminal doing the work is out of sight.
   label on top stays readable in light and dark themes.
 - **Several jobs at once.** The bar shows one job at a time. Click the meter
   or press Super+P to pick another; arrow keys (or I/K) move through the
-  list, and Return or Escape closes it.
+  list, and Return or Escape closes it. Each job in the list shows which agent
+  reported it.
 - **Fits the space it has.** Placed just before the bar's centre widget, the
   meter grows to fill the gap back to your workspaces and shrinks when that gap
   narrows. When it gets tight, the label drops to just the percentage.
@@ -77,6 +78,12 @@ for f in *.raw; do convert "$f"; echo; done | agent-progress pipe convert --tota
 
 `pipe` finishes the job when its input ends, and fails it if the input ends
 short of `--total`, the output closes, or it's interrupted.
+
+The agent is detected automatically: from `--agent` if given, then the
+`AI_AGENT` environment variable (set by Claude Code and others), then
+Claude, Codex or opencode's own variables, then an ID prefix such as
+`codex-`. Scripts and services can name themselves with `--agent "Nightly
+backup"`.
 
 Leave out `--total` when there is nothing to count against; the meter then
 shows a running count, or "working". `--state blocked` marks a job that is
